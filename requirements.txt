@@ -3,4 +3,4 @@ pdfplumber
 fonttools
 openpyxl
 pandas
- 
+reportlab
