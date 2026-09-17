@@ -26,10 +26,18 @@ from datetime import datetime
 
 import streamlit as st
 import pdfplumber
-from fontTools.ttLib import TTFont
+from fontTools.ttLib import TTFont as FontToolsTTFont
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont as ReportLabTTFont
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import ParagraphStyle
 
 
 CID_PATTERN = re.compile(r"\(cid:(\d+)\)")
@@ -48,7 +56,7 @@ def build_gid_to_unicode(font_bytes, font_number=0):
     處），確保每個使用者的字型資料彼此隔離，且該次工作階段結束、或按下
     「清除本次資料」後就會被丟棄，不會被下一位使用者的請求存取到。
     """
-    font = TTFont(io.BytesIO(font_bytes), fontNumber=font_number)
+    font = FontToolsTTFont(io.BytesIO(font_bytes), fontNumber=font_number)
     cmap = font.getBestCmap()
     glyph_order = font.getGlyphOrder()
     glyphname_to_gid = {name: idx for idx, name in enumerate(glyph_order)}
@@ -225,6 +233,97 @@ def build_excel(course_rows, other_tables):
     return buffer
 
 
+def build_pdf_report(course_rows, font_bytes, font_number=0):
+    """把整理好的課程明細輸出成一份 PDF 報表。
+
+    這裡會把使用者上傳的字型「嵌入」到輸出的這份新 PDF 裡，讓不管在哪台電腦
+    打開這份報表都能正確顯示中文。這跟先前擔心的「把字型檔案傳給第三方」是
+    不同性質的使用——把字型嵌入自己產生的文件，是幾乎所有字型授權都明文
+    允許、也是字型原本被設計要拿來做的事，不是在幫忙散布字型本身。
+    """
+    font_name = "UserCJKFont"
+    pdfmetrics.registerFont(
+        ReportLabTTFont(font_name, io.BytesIO(font_bytes), subfontIndex=font_number)
+    )
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A4),
+        leftMargin=12 * mm, rightMargin=12 * mm,
+        topMargin=12 * mm, bottomMargin=12 * mm,
+    )
+
+    title_style = ParagraphStyle(
+        "TitleCJK", fontName=font_name, fontSize=16, leading=20, spaceAfter=8,
+    )
+    cell_style = ParagraphStyle(
+        "CellCJK", fontName=font_name, fontSize=8, leading=11,
+    )
+    header_style = ParagraphStyle(
+        "HeaderCJK", fontName=font_name, fontSize=9, leading=12,
+        textColor=colors.white,
+    )
+
+    elements = [Paragraph("衛福部醫事人員繼續教育學分整理", title_style)]
+
+    total_valid = sum(r["有效積分"] for r in course_rows if r["有效積分"])
+    elements.append(Paragraph(
+        f"總筆數：{len(course_rows)}　有效積分合計：{total_valid:.2f}",
+        cell_style,
+    ))
+    elements.append(Spacer(1, 6 * mm))
+
+    headers = ["課程類別", "有效積分", "審查單位", "主辦單位", "課程名稱", "開始時間", "備註"]
+    data = [[Paragraph(h, header_style) for h in headers]]
+    for row in course_rows:
+        start_str = row["開始時間"].strftime("%Y/%m/%d %H:%M") if row["開始時間"] else ""
+        data.append([
+            Paragraph(str(row["課程類別"]), cell_style),
+            Paragraph(f'{row["有效積分"]:.2f}' if row["有效積分"] is not None else "", cell_style),
+            Paragraph(str(row["審查單位"]), cell_style),
+            Paragraph(str(row["主辦單位"]), cell_style),
+            Paragraph(str(row["課程名稱"]), cell_style),
+            Paragraph(start_str, cell_style),
+            Paragraph(str(row["備註"]), cell_style),
+        ])
+
+    col_widths = [30 * mm, 18 * mm, 30 * mm, 32 * mm, 90 * mm, 28 * mm, 18 * mm]
+    table = Table(data, colWidths=col_widths, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F2F2F2")]),
+    ]))
+    elements.append(table)
+
+    # 分類彙整（第二個表格，另起一頁附在報表後面）
+    elements.append(Spacer(1, 10 * mm))
+    elements.append(Paragraph("依課程類別彙整", title_style))
+    categories = sorted({r["課程類別"] for r in course_rows if r["課程類別"]})
+    summary_data = [[Paragraph(h, header_style) for h in ["課程類別", "有效積分合計", "堂數"]]]
+    for cat in categories:
+        cat_rows = [r for r in course_rows if r["課程類別"] == cat]
+        cat_sum = sum(r["有效積分"] for r in cat_rows if r["有效積分"])
+        summary_data.append([
+            Paragraph(cat, cell_style),
+            Paragraph(f"{cat_sum:.2f}", cell_style),
+            Paragraph(str(len(cat_rows)), cell_style),
+        ])
+    summary_table = Table(summary_data, colWidths=[60 * mm, 40 * mm, 30 * mm])
+    summary_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F2F2F2")]),
+    ]))
+    elements.append(summary_table)
+
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer
+
+
 # ---------------- Streamlit 介面 ----------------
 
 st.set_page_config(page_title="衛福部學分 PDF 整理工具", layout="wide")
@@ -266,6 +365,12 @@ with col2:
 font_number = st.number_input(
     "字型集合檔內的字型編號（一般填 0 即可；若讀取失敗可嘗試 1、2...）",
     min_value=0, max_value=10, value=0, step=1,
+)
+
+output_format = st.radio(
+    "輸出格式",
+    ["Excel（含分類彙整公式，方便後續編輯）", "PDF（含中文字型，方便直接列印/存查）", "兩者都要"],
+    horizontal=True,
 )
 
 col_run, col_clear = st.columns([3, 1])
@@ -319,13 +424,29 @@ if run_clicked:
         ).reset_index()
         st.dataframe(summary, use_container_width=True)
 
-    excel_buffer = build_excel(course_rows, other_tables)
-    st.download_button(
-        label="📥 下載整理好的 Excel",
-        data=excel_buffer,
-        file_name=f"學分整理結果_{datetime.now().strftime('%Y%m%d')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    want_excel = output_format in ("Excel（含分類彙整公式，方便後續編輯）", "兩者都要")
+    want_pdf = output_format in ("PDF（含中文字型，方便直接列印/存查）", "兩者都要")
+
+    if want_excel:
+        excel_buffer = build_excel(course_rows, other_tables)
+        st.download_button(
+            label="📥 下載整理好的 Excel",
+            data=excel_buffer,
+            file_name=f"學分整理結果_{datetime.now().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    if want_pdf:
+        try:
+            pdf_buffer = build_pdf_report(course_rows, font_file.getvalue(), font_number=font_number)
+            st.download_button(
+                label="📥 下載整理好的 PDF",
+                data=pdf_buffer,
+                file_name=f"學分整理結果_{datetime.now().strftime('%Y%m%d')}.pdf",
+                mime="application/pdf",
+            )
+        except Exception as e:
+            st.error(f"PDF 產生失敗：{e}")
 
     if other_tables:
         st.info("有部分表格格式未被自動辨識（例如頁首的個人累計統計區塊），已原樣放進 Excel 的「其他表格_待確認」分頁，請手動核對。")
