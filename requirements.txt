@@ -1,0 +1,6 @@
+streamlit
+pdfplumber
+fonttools
+openpyxl
+pandas
+ 
