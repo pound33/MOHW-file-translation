@@ -115,15 +115,16 @@ def looks_like_header(row):
     return "課程類別" in joined or "審查單位" in joined or "課程名稱" in joined
 
 
-def is_course_table(row0):
-    if len(row0) != 9:
-        return False
-    joined = normalize_text("".join(c for c in row0 if c))
-    # 原本要求三個關鍵字同時出現；放寬成至少符合兩個，避免其中一欄
-    # 因為換行/字型解碼的細微差異而漏比對到，同時仍要求 9 欄避免誤判。
-    keywords = ["課程類別", "有效", "無效", "審查單位", "主辦單位", "課程名稱"]
-    hits = sum(1 for kw in keywords if kw in joined)
-    return hits >= 3
+EXPECTED_COL_COUNT = 9
+
+
+def is_course_table_shape(row0):
+    """只看『表格外形』：是否為 9 欄。不要求第一列一定是標頭列——
+    因為這份 PDF 的課程明細表格常常橫跨很多頁，只有最一開始那頁的表格
+    第一列才是標頭，後面每一頁都是資料延續（pdfplumber 會把每頁偵測成
+    獨立的表格），如果硬性要求「第一列必須是標頭」會漏掉所有延續頁。
+    """
+    return len(row0) == EXPECTED_COL_COUNT
 
 
 def try_float(s):
@@ -133,10 +134,12 @@ def try_float(s):
         return None
 
 
-def parse_pdf(pdf_bytes, gid_to_unicode, progress_cb=None, debug_limit=5):
+def parse_pdf(pdf_bytes, gid_to_unicode, progress_cb=None, debug_sample_limit=8):
     course_rows = []
     other_tables = []
-    debug_samples = []  # 不管有沒有比對成功，都留幾筆解碼後的原始樣本供診斷
+    debug_samples = []       # 前幾筆完整樣本，供人工檢視文字內容
+    col_count_histogram = {}  # {欄數: [命中筆數, 未命中筆數]}
+    skip_reasons = {"looks_like_header": 0, "wrong_len": 0}
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         total_pages = len(pdf.pages)
@@ -148,20 +151,30 @@ def parse_pdf(pdf_bytes, gid_to_unicode, progress_cb=None, debug_limit=5):
                     continue
                 decoded_rows = [decode_row(r, gid_to_unicode) for r in raw_rows]
 
-                if len(debug_samples) < debug_limit:
+                n_cols = len(decoded_rows[0]) if decoded_rows else 0
+                matched = is_course_table_shape(decoded_rows[0]) if decoded_rows else False
+
+                hit_key = n_cols
+                if hit_key not in col_count_histogram:
+                    col_count_histogram[hit_key] = [0, 0]
+                col_count_histogram[hit_key][0 if matched else 1] += 1
+
+                if len(debug_samples) < debug_sample_limit:
                     debug_samples.append({
                         "頁碼": page_idx,
                         "表格編號": t_idx,
-                        "欄數": len(decoded_rows[0]) if decoded_rows else 0,
+                        "欄數": n_cols,
                         "第一列(可能是標頭)": decoded_rows[0] if decoded_rows else [],
-                        "是否判定為課程表格": is_course_table(decoded_rows[0]) if decoded_rows else False,
+                        "是否判定為課程表格": matched,
                     })
 
-                if is_course_table(decoded_rows[0]):
-                    for r in decoded_rows[1:]:
+                if matched:
+                    for r in decoded_rows:  # 不再跳過第一列；改成逐列判斷是否為標頭
                         if looks_like_header(r):
+                            skip_reasons["looks_like_header"] += 1
                             continue
                         if len(r) != 9:
+                            skip_reasons["wrong_len"] += 1
                             continue
                         flag, category, valid_pts, invalid_pts, reviewer, organizer, course_name, time_cell, remark = r
                         start_dt, end_dt = split_datetime_cell(time_cell)
@@ -188,7 +201,12 @@ def parse_pdf(pdf_bytes, gid_to_unicode, progress_cb=None, debug_limit=5):
             if progress_cb:
                 progress_cb(page_idx / total_pages)
 
-    return course_rows, other_tables, debug_samples
+    debug_info = {
+        "col_count_histogram": col_count_histogram,
+        "skip_reasons": skip_reasons,
+        "samples": debug_samples,
+    }
+    return course_rows, other_tables, debug_info
 
 
 def build_excel(course_rows, other_tables):
@@ -392,7 +410,7 @@ font_number = st.number_input(
 
 output_format = st.radio(
     "輸出格式",
-    ["Excel（含分類彙整公式，方便後續編輯）", "PDF（含中文字型，方便直接列印/存查）", "兩者都要"],
+    ["PDF（含中文字型，方便直接列印/存查）", "Excel（含分類彙整公式，方便後續編輯）", "兩者都要"],
     horizontal=True,
 )
 
@@ -426,7 +444,7 @@ if run_clicked:
         progress_bar.progress(frac, text=f"解析 PDF 中... {int(frac * 100)}%")
 
     try:
-        course_rows, other_tables, debug_samples = parse_pdf(
+        course_rows, other_tables, debug_info = parse_pdf(
             pdf_file.getvalue(), gid_to_unicode, progress_cb=_progress
         )
     except Exception as e:
@@ -434,13 +452,27 @@ if run_clicked:
         st.stop()
     progress_bar.empty()
 
-    with st.expander("🔍 診斷資訊：程式實際解碼出來的文字長怎樣（點開查看）", expanded=(len(course_rows) == 0)):
+    with st.expander("🔍 診斷資訊：欄位數分佈與比對狀況", expanded=(len(course_rows) < 20)):
         st.write(
-            "如果下面「第一列(可能是標頭)」看到的是方框 □、亂碼符號，或是明明"
-            "看起來像「課程類別」卻沒被判定為課程表格，代表字型解碼對不起來"
-            "（很可能字型檔案跟產生這份 PDF 當初用的字型不是同一個檔案）。"
+            "下表統計「整份 PDF 裡所有偵測到的表格」，依欄位數分組，"
+            "看有多少表格被判定為課程明細（命中）、多少沒被判定到（未命中）。"
+            "如果有其他欄位數（例如 8 欄或 7 欄）也有大量「未命中」，"
+            "代表這份 PDF 裡課程表格的欄位數不只 9 欄一種，需要放寬規則去涵蓋。"
         )
-        for sample in debug_samples:
+        hist = debug_info["col_count_histogram"]
+        if hist:
+            st.table({
+                "欄數": list(hist.keys()),
+                "命中(判定為課程表格)": [v[0] for v in hist.values()],
+                "未命中": [v[1] for v in hist.values()],
+            })
+        st.write(f"資料列被跳過的原因統計：{debug_info['skip_reasons']}"
+                 "（looks_like_header：該列被誤判為重複出現的標頭列而跳過；"
+                 "wrong_len：該列欄位數與表頭不一致而跳過）")
+
+        st.write("---")
+        st.write("前幾個表格的原始樣本（含未命中的）：")
+        for sample in debug_info["samples"]:
             st.write(
                 f"頁碼 {sample['頁碼']}、表格 {sample['表格編號']}、"
                 f"共 {sample['欄數']} 欄、"
