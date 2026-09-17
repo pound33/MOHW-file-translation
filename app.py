@@ -120,9 +120,10 @@ def try_float(s):
         return None
 
 
-def parse_pdf(pdf_bytes, gid_to_unicode, progress_cb=None):
+def parse_pdf(pdf_bytes, gid_to_unicode, progress_cb=None, debug_limit=5):
     course_rows = []
     other_tables = []
+    debug_samples = []  # 不管有沒有比對成功，都留幾筆解碼後的原始樣本供診斷
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         total_pages = len(pdf.pages)
@@ -133,6 +134,15 @@ def parse_pdf(pdf_bytes, gid_to_unicode, progress_cb=None):
                 if not raw_rows:
                     continue
                 decoded_rows = [decode_row(r, gid_to_unicode) for r in raw_rows]
+
+                if len(debug_samples) < debug_limit:
+                    debug_samples.append({
+                        "頁碼": page_idx,
+                        "表格編號": t_idx,
+                        "欄數": len(decoded_rows[0]) if decoded_rows else 0,
+                        "第一列(可能是標頭)": decoded_rows[0] if decoded_rows else [],
+                        "是否判定為課程表格": is_course_table(decoded_rows[0]) if decoded_rows else False,
+                    })
 
                 if is_course_table(decoded_rows[0]):
                     for r in decoded_rows[1:]:
@@ -165,7 +175,7 @@ def parse_pdf(pdf_bytes, gid_to_unicode, progress_cb=None):
             if progress_cb:
                 progress_cb(page_idx / total_pages)
 
-    return course_rows, other_tables
+    return course_rows, other_tables, debug_samples
 
 
 def build_excel(course_rows, other_tables):
@@ -403,11 +413,27 @@ if run_clicked:
         progress_bar.progress(frac, text=f"解析 PDF 中... {int(frac * 100)}%")
 
     try:
-        course_rows, other_tables = parse_pdf(pdf_file.getvalue(), gid_to_unicode, progress_cb=_progress)
+        course_rows, other_tables, debug_samples = parse_pdf(
+            pdf_file.getvalue(), gid_to_unicode, progress_cb=_progress
+        )
     except Exception as e:
         st.error(f"PDF 解析失敗：{e}")
         st.stop()
     progress_bar.empty()
+
+    with st.expander("🔍 診斷資訊：程式實際解碼出來的文字長怎樣（點開查看）", expanded=(len(course_rows) == 0)):
+        st.write(
+            "如果下面「第一列(可能是標頭)」看到的是方框 □、亂碼符號，或是明明"
+            "看起來像「課程類別」卻沒被判定為課程表格，代表字型解碼對不起來"
+            "（很可能字型檔案跟產生這份 PDF 當初用的字型不是同一個檔案）。"
+        )
+        for sample in debug_samples:
+            st.write(
+                f"頁碼 {sample['頁碼']}、表格 {sample['表格編號']}、"
+                f"共 {sample['欄數']} 欄、"
+                f"判定為課程表格：{'✅ 是' if sample['是否判定為課程表格'] else '❌ 否'}"
+            )
+            st.code(str(sample["第一列(可能是標頭)"]))
 
     st.success(f"解析完成！共取得 {len(course_rows)} 筆課程明細，另有 {len(other_tables)} 個其他格式表格。")
 
