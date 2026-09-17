@@ -22,6 +22,7 @@
 
 import re
 import io
+import unicodedata
 from datetime import datetime
 
 import streamlit as st
@@ -101,16 +102,28 @@ def split_datetime_cell(cell_text):
     return "", ""
 
 
+def normalize_text(text):
+    """Unicode 正規化 (NFKC)：把「相容表意文字」等視覺相同但編碼點不同的
+    CJK 字元統一成標準碼位，避免肉眼看起來一樣的字卻比對不到的問題。"""
+    if not text:
+        return ""
+    return unicodedata.normalize("NFKC", text)
+
+
 def looks_like_header(row):
-    joined = "".join(c for c in row if c)
+    joined = normalize_text("".join(c for c in row if c))
     return "課程類別" in joined or "審查單位" in joined or "課程名稱" in joined
 
 
 def is_course_table(row0):
     if len(row0) != 9:
         return False
-    joined = "".join(c for c in row0 if c)
-    return ("課程類別" in joined and "有效" in joined and "課程名稱" in joined)
+    joined = normalize_text("".join(c for c in row0 if c))
+    # 原本要求三個關鍵字同時出現；放寬成至少符合兩個，避免其中一欄
+    # 因為換行/字型解碼的細微差異而漏比對到，同時仍要求 9 欄避免誤判。
+    keywords = ["課程類別", "有效", "無效", "審查單位", "主辦單位", "課程名稱"]
+    hits = sum(1 for kw in keywords if kw in joined)
+    return hits >= 3
 
 
 def try_float(s):
@@ -433,7 +446,7 @@ if run_clicked:
                 f"共 {sample['欄數']} 欄、"
                 f"判定為課程表格：{'✅ 是' if sample['是否判定為課程表格'] else '❌ 否'}"
             )
-            st.code(str(sample["第一列(可能是標頭)"]))
+            st.code(repr(sample["第一列(可能是標頭)"]))
 
     st.success(f"解析完成！共取得 {len(course_rows)} 筆課程明細，另有 {len(other_tables)} 個其他格式表格。")
 
